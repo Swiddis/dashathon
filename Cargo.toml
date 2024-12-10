@@ -1,0 +1,9 @@
+[package]
+name = "dashathon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+octocrab = "0.42.1"
+thiserror = "2.0.6"
+tokio = { version = "1.42.0", features = ["full"] }
