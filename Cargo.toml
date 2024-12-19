@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+log = "0.4.22"
 octocrab = "0.42.1"
 opensearch = "2.3.0"
 ratelimit = "0.10.0"

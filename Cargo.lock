@@ -228,6 +228,7 @@ dependencies = [
 name = "dashathon-collector"
 version = "0.1.0"
 dependencies = [
+ "log",
  "octocrab",
  "opensearch",
  "ratelimit",
