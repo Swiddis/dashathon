@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use octocrab::{models::issues::Issue, params::issues::Sort, Octocrab, Page};
+use octocrab::{models::issues::Issue, params::{issues::Sort, State}, Octocrab, Page};
 use opensearch::{http::StatusCode, BulkParts, OpenSearch};
 use ratelimit::Ratelimiter;
 use serde_json::json;
@@ -97,6 +97,7 @@ async fn get_issue_page(client: &Octocrab, page: u32) -> Page<Issue> {
         .issues("opensearch-project", "opensearch-dashboards")
         .list()
         .sort(Sort::Created)
+        .state(State::All)
         .per_page(100)
         .page(page)
         .send()
@@ -151,7 +152,7 @@ fn start_update_tracking(
         log::info!("starting main update loop");
 
         loop {
-            // TODO use Events API to detect updates and put in SQLite store
+            // TODO use Events API to detect updates
             break;
         }
     })
@@ -192,6 +193,8 @@ fn start_backfill(
             }
             curr_page += 1;
         }
+
+        log::info!("backfill complete!");
     })
 }
 
@@ -248,6 +251,7 @@ async fn main() -> Result<(), MetricCollectionError> {
     let opensearch_client = OpenSearch::default(); // TODO config
     let (request_sender, request_receiver) = mpsc::channel::<DataRequest>(16);
     let (scrape_sender, scrape_receiver) = mpsc::channel::<EntityUpdate>(256);
+    // We take the current time as a pivot point to cleanly separate new events and backfilling.
     let now = Utc::now();
 
     log::info!("successfully set up clients and channels, spawning main tasks");
