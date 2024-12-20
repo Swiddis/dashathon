@@ -143,7 +143,7 @@ fn start_request_handling(
     tokio::spawn(async move {
         log::debug!("starting main request loop");
         loop {
-            if let Err(sleep) = limiter.try_wait() {
+            while let Err(sleep) = limiter.try_wait() {
                 tokio::time::sleep(sleep).await;
             }
 
