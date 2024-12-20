@@ -1,4 +1,8 @@
 use chrono::{DateTime, Utc};
+use color_eyre::{
+    eyre::{Context, Result},
+    Section,
+};
 use octocrab::{
     models::issues::Issue,
     params::{issues::Sort, State},
@@ -8,20 +12,7 @@ use opensearch::{http::StatusCode, BulkParts, OpenSearch};
 use ratelimit::Ratelimiter;
 use serde_json::json;
 use std::{env, time::Duration};
-use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
-/// CollectionError represents the top-level error type of the application, with
-/// all its failure modes
-#[derive(Error, Debug)]
-enum CollectionError {
-    #[error("failed to configure {context} during startup: {message}")]
-    ConfigError { context: String, message: String },
-    #[error("preflight failed for {context}: {message}")]
-    PreflightError { context: String, message: String },
-    #[error("a task terminated unexpectedly: {message}")]
-    TaskPanic { message: String },
-}
 
 /// Update messages for GitHub entities
 #[derive(Debug, Clone)]
@@ -58,83 +49,62 @@ enum DataRequest {
     IssuePage(u32, oneshot::Sender<Page<Issue>>),
 }
 
-async fn github_ratelimiter(client: &Octocrab) -> Result<Ratelimiter, CollectionError> {
-    let limits = client.ratelimit().get().await;
-    match limits {
-        Ok(limits) => {
-            let refresh_ivl = Duration::from_secs(3600).div_f64(limits.rate.limit as f64);
-            Ok(Ratelimiter::builder(1, refresh_ivl)
-                .max_tokens(limits.rate.limit as u64)
-                .initial_available(limits.rate.remaining as u64)
-                .build()
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "GitHub returned an illegal rate limit state: {:?}",
-                        limits.rate
-                    )
-                }))
-        }
-        Err(err) => Err(CollectionError::PreflightError {
-            context: "GitHub".to_string(),
-            message: err.to_string(),
-        }),
-    }
+async fn github_ratelimiter(client: &Octocrab) -> Result<Ratelimiter> {
+    let limits = client
+        .ratelimit()
+        .get()
+        .await
+        .wrap_err("failed to fetch rate limit from GitHub")?;
+    let refresh_ivl = Duration::from_secs(3600).div_f64(limits.rate.limit as f64);
+    Ok(Ratelimiter::builder(1, refresh_ivl)
+        .max_tokens(limits.rate.limit as u64)
+        .initial_available(limits.rate.remaining as u64)
+        .build()
+        .unwrap_or_else(|_| {
+            panic!(
+                "GitHub returned an illegal rate limit state: {:?}",
+                limits.rate
+            )
+        }))
 }
 
 /// Since handling persistent errors after startup is annoying, we run a
 /// preflight to check the config before really getting started.
-async fn do_preflight(
-    opensearch: OpenSearch,
-    octocrab: Octocrab,
-) -> Result<Ratelimiter, CollectionError> {
-    log::info!("Running preflight");
+async fn do_preflight(opensearch: OpenSearch, octocrab: Octocrab) -> Result<Ratelimiter> {
+    log::debug!("running preflight");
 
-    let (os_result, octo_result) = tokio::join!(
-        tokio::spawn(async move { opensearch.info().send().await }),
-        tokio::spawn(async move { github_ratelimiter(&octocrab).await }),
-    );
+    let (os_result, octo_result) = tokio::try_join!(
+        tokio::spawn(async move {
+            let response = opensearch
+                .info()
+                .send()
+                .await
+                .wrap_err("failed to connect to OpenSearch cluster")?;
 
-    match os_result {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
-            return Err(CollectionError::PreflightError {
-                context: "OpenSearch".to_string(),
-                message: err.to_string(),
-            })
-        }
-        Err(err) => {
-            return Err(CollectionError::PreflightError {
-                context: "Tokio runtime".to_string(),
-                message: err.to_string(),
-            })
-        }
-    };
-
-    match octo_result {
-        Ok(Ok(lim)) => Ok(lim),
-        Ok(Err(err)) => Err(err),
-        Err(err) => Err(CollectionError::PreflightError {
-            context: "Tokio runtime".to_string(),
-            message: err.to_string(),
+            response.error_for_status_code().wrap_err("OpenSearch cluster failed to return info")
         }),
-    }
+        tokio::spawn(async move { github_ratelimiter(&octocrab).await }),
+    )
+    .expect("unable to execute preflight tasks"); // Likely means the tokio runtime is broken, which is fatal
+
+    os_result
+        .context("OpenSearch client preflight check")
+        .suggestion("check the OpenSearch cluster and client configuration")?;
+    octo_result
+        .context("GitHub client preflight check")
+        .suggestion("check the GitHub client configuration")
 }
 
-fn octocrab_client() -> Result<Octocrab, CollectionError> {
+fn octocrab_client() -> Result<Octocrab> {
     // TODO probably should be config instead of env.
     let token = env::var("GH_TOKEN").unwrap_or("".to_string());
     let mut builder = octocrab::OctocrabBuilder::new();
     if !token.is_empty() {
         builder = builder.personal_token(token);
+    } else {
+        log::warn!("no GitHub PAT found, this will result in a significantly lower rate limit");
     };
-    let result = builder.build();
-    match result {
-        Ok(client) => Ok(client),
-        Err(err) => Err(CollectionError::ConfigError {
-            context: "Octocrab client".to_string(),
-            message: err.to_string(),
-        }),
-    }
+    builder.build().wrap_err("failed to build GitHub client")
 }
 
 async fn get_issue_page(client: &Octocrab, page: u32) -> Page<Issue> {
@@ -286,7 +256,12 @@ fn start_uploading(
     })
 }
 
-async fn run() -> Result<(), CollectionError> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    // App-level hooks for logging and error reporting
+    env_logger::init();
+    color_eyre::install()?;
+
     let octo_client = octocrab_client()?;
     let opensearch_client = OpenSearch::default(); // TODO config
 
@@ -299,35 +274,13 @@ async fn run() -> Result<(), CollectionError> {
     // We use the current time as a pivot point to cleanly separate new events and backfilling.
     let now = Utc::now();
 
-    let result = tokio::try_join!(
+    tokio::try_join!(
         start_request_handling(octo_client, limiter, request_receiver),
         start_update_tracking(request_sender.clone(), scrape_sender.clone(), now),
         start_backfill(request_sender, scrape_sender, now),
         start_uploading(opensearch_client, scrape_receiver),
-    );
+    )?;
 
     log::info!("main task batch has terminated, shutting down");
-
-    // In normal operation, the above join never terminates. Handle any errors that came up.
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) => Err(CollectionError::TaskPanic {
-            message: err.to_string(),
-        }),
-    }
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> std::process::ExitCode {
-    env_logger::init();
-
-    let result = run().await;
-
-    match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(err) => {
-            log::error!("{err}");
-            std::process::ExitCode::FAILURE
-        }
-    }
+    Ok(())
 }
