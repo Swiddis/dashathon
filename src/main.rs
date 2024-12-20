@@ -88,10 +88,10 @@ async fn do_preflight(opensearch: OpenSearch, octocrab: Octocrab) -> Result<Rate
     .expect("unable to execute preflight tasks"); // Likely means the tokio runtime is broken, which is fatal
 
     os_result
-        .context("OpenSearch client preflight check")
+        .wrap_err("OpenSearch client preflight check")
         .suggestion("check the OpenSearch cluster and client configuration")?;
     octo_result
-        .context("GitHub client preflight check")
+        .wrap_err("GitHub client preflight check")
         .suggestion("check the GitHub client configuration")
 }
 
