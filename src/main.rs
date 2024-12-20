@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use octocrab::{models::issues::Issue, params::issues::Sort, Octocrab, Page};
+use opensearch::{http::StatusCode, BulkParts, OpenSearch};
 use ratelimit::Ratelimiter;
+use serde_json::json;
 use std::{env, time::Duration};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -15,16 +17,33 @@ enum MetricCollectionError {
     TaskRuntimeError { message: String },
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EntityType {
-    Issue,
-}
-
 /// Update messages for GitHub entities
 #[derive(Debug, Clone)]
-struct EntityUpdate {
-    _e_type: EntityType,
-    _id: u64,
+enum EntityUpdate {
+    Issue(Box<Issue>),
+}
+
+impl EntityUpdate {
+    fn bulk_entry(&self) -> Option<[String; 2]> {
+        let serialized: Result<String, serde_json::Error>;
+        let index_entry: String;
+
+        match self {
+            EntityUpdate::Issue(ref issue) => {
+                serialized = serde_json::to_string(&issue);
+                index_entry =
+                    json!({ "index": { "_index": "github_issues", "_id": *issue.id } }).to_string();
+            }
+        };
+
+        match serialized {
+            Ok(s) => Some([index_entry, s]),
+            Err(err) => {
+                log::error!("unserializable update ({err}): {self:?}");
+                None
+            }
+        }
+    }
 }
 
 /// Types of entities we care about requesting from the GitHub API
@@ -86,7 +105,10 @@ async fn get_issue_page(client: &Octocrab, page: u32) -> Page<Issue> {
 }
 
 async fn handle_data_request(client: &Octocrab, req: DataRequest) {
-    log::debug!("Received request: {req:?}");
+    // TODO ideally we should cache results in a local file to recover quickly from a cache, but not
+    // P0 since otherwise we can just backfill everything again (mostly annoying since many comments
+    // may bump the rate limit)
+    log::debug!("received request: {req:?}");
     match req {
         DataRequest::IssuePage(page, sender) => {
             let result = get_issue_page(client, page).await;
@@ -143,6 +165,8 @@ fn start_backfill(
     ignore_updated_after: DateTime<Utc>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // TODO we currently only backfill the issues, also need to backfill PRs, comments, and
+        // other info
         let mut curr_page = 1;
         let mut has_next = true;
 
@@ -150,9 +174,8 @@ fn start_backfill(
 
         while has_next {
             let (send, rec) = oneshot::channel();
-            // If the request handler stops running and we get errors while communicating with it,
-            // just shutdown this task silently
             let Ok(_) = requests.send(DataRequest::IssuePage(curr_page, send)).await else {
+                // If the request handler is no longer running, there's nothing left to do
                 return;
             };
             let Ok(page) = rec.await else { return };
@@ -163,10 +186,7 @@ fn start_backfill(
                 .filter(|i| i.updated_at < ignore_updated_after)
             {
                 updates
-                    .send(EntityUpdate {
-                        _e_type: EntityType::Issue,
-                        _id: *issue.id,
-                    })
+                    .send(EntityUpdate::Issue(Box::new(issue)))
                     .await
                     .unwrap();
             }
@@ -175,13 +195,47 @@ fn start_backfill(
     })
 }
 
+async fn upload_entries(client: &OpenSearch, updates: &Vec<EntityUpdate>) {
+    log::debug!("uploading {} entity update(s)", updates.len());
+    let updates = updates
+        .iter()
+        .filter_map(|upd| upd.bulk_entry())
+        .flatten()
+        .collect();
+
+    // TODO handle error
+    let response = client
+        .bulk(BulkParts::None)
+        .body(updates)
+        .send()
+        .await
+        .unwrap();
+    match response.status_code() {
+        StatusCode::OK => {}
+        code => {
+            log::error!("encountered error from OpenSearch ({code}): {}", response.text().await.unwrap());
+            todo!("handle error")
+        }
+    };
+}
+
 /// Preprocess and upload records found in scrape tasks to OpenSearch.
-fn start_uploading(mut receiver: mpsc::Receiver<EntityUpdate>) -> tokio::task::JoinHandle<()> {
+fn start_uploading(
+    client: OpenSearch,
+    mut receiver: mpsc::Receiver<EntityUpdate>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         log::info!("starting main upload loop");
+        let mut buffer = Vec::new();
 
-        while let Some(update) = receiver.recv().await {
-            log::trace!("processing entity update: {update:?}");
+        loop {
+            let updates = receiver.recv_many(&mut buffer, 128).await;
+            if updates == 0 {
+                // No messages are left and the upstream channels have closed, shut down gracefully
+                return;
+            }
+            upload_entries(&client, &buffer).await;
+            buffer.clear();
         }
     })
 }
@@ -190,18 +244,19 @@ fn start_uploading(mut receiver: mpsc::Receiver<EntityUpdate>) -> tokio::task::J
 async fn main() -> Result<(), MetricCollectionError> {
     env_logger::init();
 
-    let client = octocrab_client()?;
-    let (request_sender, request_receiver) = mpsc::channel::<DataRequest>(32);
-    let (scrape_sender, scrape_receiver) = mpsc::channel::<EntityUpdate>(32);
+    let octo_client = octocrab_client()?;
+    let opensearch_client = OpenSearch::default(); // TODO config
+    let (request_sender, request_receiver) = mpsc::channel::<DataRequest>(16);
+    let (scrape_sender, scrape_receiver) = mpsc::channel::<EntityUpdate>(256);
     let now = Utc::now();
 
-    log::info!("successfully set up GitHub client and channels, spawning main tasks");
+    log::info!("successfully set up clients and channels, spawning main tasks");
 
     let result = tokio::try_join!(
-        start_request_handling(client, request_receiver),
+        start_request_handling(octo_client, request_receiver),
         start_update_tracking(request_sender.clone(), scrape_sender.clone(), now.clone()),
         start_backfill(request_sender, scrape_sender, now),
-        start_uploading(scrape_receiver),
+        start_uploading(opensearch_client, scrape_receiver),
     );
 
     log::info!("main task batch has terminated, shutting down");
