@@ -150,11 +150,7 @@ fn start_update_tracking(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         log::info!("starting main update loop");
-
-        loop {
-            // TODO use Events API to detect updates
-            break;
-        }
+        // TODO use Events API to detect updates
     })
 }
 
@@ -198,7 +194,7 @@ fn start_backfill(
     })
 }
 
-async fn upload_entries(client: &OpenSearch, updates: &Vec<EntityUpdate>) {
+async fn upload_entries(client: &OpenSearch, updates: &[EntityUpdate]) {
     log::debug!("uploading {} entity update(s)", updates.len());
     let updates = updates
         .iter()
@@ -258,7 +254,7 @@ async fn main() -> Result<(), MetricCollectionError> {
 
     let result = tokio::try_join!(
         start_request_handling(octo_client, request_receiver),
-        start_update_tracking(request_sender.clone(), scrape_sender.clone(), now.clone()),
+        start_update_tracking(request_sender.clone(), scrape_sender.clone(), now),
         start_backfill(request_sender, scrape_sender, now),
         start_uploading(opensearch_client, scrape_receiver),
     );
